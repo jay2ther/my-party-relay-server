@@ -1,135 +1,145 @@
-const WebSocket = require('ws');
-const PORT = process.env.PORT || 8080;
-const wss = new WebSocket.Server({ port: PORT });
+const { WebSocketServer } = require('ws');
+const http = require('http');
 
-// Maps roomCode -> { hostSocket: ws, playerSockets: Map(playerId -> ws) }
+// Render.com uses the PORT environment variable. Defaults to 10000.
+const PORT = process.env.PORT || 10000;
+
+// Create an HTTP server so Render.com can perform its required health checks.
+const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('Relay server is running');
+});
+
+const wss = new WebSocketServer({ server });
+
+// Structure: Map( roomCode -> { hostSocket, clients: Map(clientId -> socket) } )
 const rooms = new Map();
 
-wss.on('connection', (ws) => {
-    ws.isAlive = true;
-    ws.on('pong', () => { ws.isAlive = true; });
-
-    let currentRoomCode = null;
+wss.on('connection', (socket) => {
+    let myRoomCode = null;
     let isHost = false;
-    let playerId = null;
+    let myClientId = null;
 
-    ws.on('message', (message) => {
+    socket.on('message', (message) => {
         try {
-            const parsed = JSON.parse(message);
-            const { action, roomCode, data } = parsed;
-
-            if (action === 'register_host') {
-                const code = roomCode.toUpperCase();
-                if (rooms.has(code)) {
-                    ws.send(JSON.stringify({ type: 'error', message: 'Room code already exists.' }));
-                    return;
-                }
-                rooms.set(code, { host: ws, players: new Map() });
-                currentRoomCode = code;
-                isHost = true;
-                ws.send(JSON.stringify({ type: 'host_registered', roomCode: code }));
-                console.log(`Room [${code}] registered by Host.`);
-            }
-
-            else if (action === 'join_room') {
-                const code = roomCode.toUpperCase();
-                if (!rooms.has(code)) {
-                    ws.send(JSON.stringify({ type: 'error', message: 'Room not found.' }));
-                    return;
-                }
+            const data = JSON.parse(message);
+            
+            // 1. Godot registers as the Room Host
+            if (data.action === 'host') {
+                const roomCode = data.room.toUpperCase();
                 
-                const room = rooms.get(code);
-                playerId = '_' + Math.random().toString(36).substr(2, 9); // Create a temporary unique ID
-                room.players.set(playerId, ws);
-                currentRoomCode = code;
+                if (rooms.has(roomCode)) {
+                    socket.send(JSON.stringify({ type: 'error', message: 'Room code already exists.' }));
+                    return;
+                }
 
-                // Tell the player's phone that they succeeded
-                ws.send(JSON.stringify({ type: 'joined', playerId: playerId, roomCode: code }));
+                myRoomCode = roomCode;
+                isHost = true;
+                
+                rooms.set(roomCode, {
+                    hostSocket: socket,
+                    clients: new Map()
+                });
+                
+                console.log(`Room created: ${roomCode}`);
+                socket.send(JSON.stringify({ type: 'host_registered', room: roomCode }));
+            } 
+            
+            // 2. Mobile client joins a specific room
+            else if (data.action === 'join') {
+                const roomCode = data.room.toUpperCase();
+                const clientId = data.clientId;
 
-                // Tell the Godot Host that a player joined
-                if (room.host && room.host.readyState === WebSocket.OPEN) {
-                    room.host.send(JSON.stringify({
+                if (!rooms.has(roomCode)) {
+                    socket.send(JSON.stringify({ type: 'error', message: 'Room not found.' }));
+                    return;
+                }
+
+                const room = rooms.get(roomCode);
+                
+                myRoomCode = roomCode;
+                myClientId = clientId;
+                isHost = false;
+                
+                room.clients.set(clientId, socket);
+                
+                console.log(`Client ${clientId} joined room ${roomCode}`);
+                socket.send(JSON.stringify({ type: 'join_success', room: roomCode }));
+                
+                // Notify the Godot host that a client joined
+                if (room.hostSocket && room.hostSocket.readyState === 1) { // 1 = OPEN
+                    room.hostSocket.send(JSON.stringify({
                         type: 'player_joined',
-                        playerId: playerId,
-                        playerName: data.playerName || 'Anonymous'
+                        clientId: clientId
                     }));
                 }
-                console.log(`Player ${playerId} joined Room [${code}].`);
-            }
-
-            else if (action === 'send_to_host') {
-                // Relays phone input to Godot
-                if (!currentRoomCode || !rooms.has(currentRoomCode)) return;
-                const room = rooms.get(currentRoomCode);
-                if (room.host && room.host.readyState === WebSocket.OPEN) {
-                    room.host.send(JSON.stringify({
-                        type: 'player_input',
-                        playerId: playerId,
-                        payload: data
-                    }));
+            } 
+            
+            // 3. Relay message from Phone -> Godot
+            else if (data.action === 'to_host') {
+                if (myRoomCode && rooms.has(myRoomCode)) {
+                    const room = rooms.get(myRoomCode);
+                    if (room.hostSocket && room.hostSocket.readyState === 1) {
+                        room.hostSocket.send(JSON.stringify({
+                            type: 'client_message',
+                            clientId: myClientId,
+                            payload: data.payload
+                        }));
+                    }
                 }
-            }
-
-            else if (action === 'send_to_player') {
-                // Host sends something back to a specific phone (e.g., feedback/points)
-                if (!isHost || !currentRoomCode) return;
-                const room = rooms.get(currentRoomCode);
-                const targetId = parsed.targetPlayerId;
-                if (room && room.players.has(targetId)) {
-                    const playerWs = room.players.get(targetId);
-                    if (playerWs.readyState === WebSocket.OPEN) {
-                        playerWs.send(JSON.stringify({
+            } 
+            
+            // 4. Relay message from Godot -> Specific Phone
+            else if (data.action === 'to_client') {
+                const targetClientId = data.clientId;
+                if (myRoomCode && rooms.has(myRoomCode) && isHost) {
+                    const room = rooms.get(myRoomCode);
+                    const clientSocket = room.clients.get(targetClientId);
+                    if (clientSocket && clientSocket.readyState === 1) {
+                        clientSocket.send(JSON.stringify({
                             type: 'host_message',
-                            payload: data
+                            payload: data.payload
                         }));
                     }
                 }
             }
-
-        } catch (e) {
-            console.error("Failed to parse message or route action:", e);
+        } catch (err) {
+            console.error('Error parsing JSON message:', err);
         }
     });
 
-    ws.on('close', () => {
-        if (currentRoomCode && rooms.has(currentRoomCode)) {
-            const room = rooms.get(currentRoomCode);
-            if (isHost) {
-                // Host disconnected: Disconnect all players and clean up the room
-                for (const [pId, playerWs] of room.players) {
-                    if (playerWs.readyState === WebSocket.OPEN) {
-                        playerWs.send(JSON.stringify({ type: 'error', message: 'Host disconnected.' }));
-                        playerWs.close();
-                    }
-                }
-                rooms.delete(currentRoomCode);
-                console.log(`Room [${currentRoomCode}] cleared because host disconnected.`);
-            } else if (playerId) {
-                // Player disconnected: Inform host
-                room.players.delete(playerId);
-                if (room.host && room.host.readyState === WebSocket.OPEN) {
-                    room.host.send(JSON.stringify({
+    // 5. Cleanup when someone disconnects
+    socket.on('close', () => {
+        if (!myRoomCode) return;
+
+        if (isHost) {
+            // Godot disconnected: close room, alert clients, and purge room
+            console.log(`Host closed room: ${myRoomCode}`);
+            const room = rooms.get(myRoomCode);
+            if (room) {
+                room.clients.forEach((clientSocket) => {
+                    clientSocket.send(JSON.stringify({ type: 'room_closed' }));
+                    clientSocket.close();
+                });
+                rooms.delete(myRoomCode);
+            }
+        } else {
+            // Phone disconnected: notify Godot, remove player
+            console.log(`Client ${myClientId} disconnected from room ${myRoomCode}`);
+            const room = rooms.get(myRoomCode);
+            if (room) {
+                room.clients.delete(myClientId);
+                if (room.hostSocket && room.hostSocket.readyState === 1) {
+                    room.hostSocket.send(JSON.stringify({
                         type: 'player_left',
-                        playerId: playerId
+                        clientId: myClientId
                     }));
                 }
-                console.log(`Player ${playerId} disconnected.`);
             }
         }
     });
 });
 
-// Periodic ping/pong to keep connections alive on free tiers
-const interval = setInterval(() => {
-    wss.clients.forEach((ws) => {
-        if (ws.isAlive === false) return ws.terminate();
-        ws.isAlive = false;
-        ws.ping();
-    });
-}, 30000);
-
-wss.on('close', () => {
-    clearInterval(interval);
+server.listen(PORT, () => {
+    console.log(`Server listening on port ${PORT}`);
 });
-
-console.log(`Relay server actively listening on port ${PORT}`);
