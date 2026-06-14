@@ -1,5 +1,5 @@
-const { WebSocketServer } = require('ws');
-const http = require('http');
+import { WebSocketServer } from 'ws';
+import http from 'http';
 
 // Render.com uses the PORT environment variable. Defaults to 10000.
 const PORT = process.env.PORT || 10000;
