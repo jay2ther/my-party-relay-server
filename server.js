@@ -1,136 +1,135 @@
-import { WebSocketServer } from 'ws';
-
+const WebSocket = require('ws');
 const PORT = process.env.PORT || 8080;
-const wss = new WebSocketServer({ port: PORT });
+const wss = new WebSocket.Server({ port: PORT });
 
-// Active sessions tracking layout: room_code -> { host: ws, players: Map(name -> ws) }
+// Maps roomCode -> { hostSocket: ws, playerSockets: Map(playerId -> ws) }
 const rooms = new Map();
 
 wss.on('connection', (ws) => {
-    console.log("New raw socket handshake established.");
-    
-    ws.isHost = false;
-    ws.roomCode = "";
-    ws.playerName = "";
+    ws.isAlive = true;
+    ws.on('pong', () => { ws.isAlive = true; });
+
+    let currentRoomCode = null;
+    let isHost = false;
+    let playerId = null;
 
     ws.on('message', (message) => {
-        let data;
         try {
-            data = JSON.parse(message);
-        } catch (e) {
-            console.log("Dropped packet: Incoming stream payload is not valid JSON.");
-            return;
-        }
+            const parsed = JSON.parse(message);
+            const { action, roomCode, data } = parsed;
 
-        const { action, room_code, name, target_name, payload } = data;
-
-        switch (action) {
-            case 'register_host':
-                if (!room_code) return;
-                const cleanHostCode = room_code.toUpperCase();
-                
-                // Verify if the Godot-generated key is already in active use
-                if (rooms.has(cleanHostCode)) {
-                    ws.send(JSON.stringify({ action: 'error', message: 'room_collision' }));
-                    console.log(`Registration Denied: Host code collision detected on -> ${cleanHostCode}`);
+            if (action === 'register_host') {
+                const code = roomCode.toUpperCase();
+                if (rooms.has(code)) {
+                    ws.send(JSON.stringify({ type: 'error', message: 'Room code already exists.' }));
                     return;
                 }
+                rooms.set(code, { host: ws, players: new Map() });
+                currentRoomCode = code;
+                isHost = true;
+                ws.send(JSON.stringify({ type: 'host_registered', roomCode: code }));
+                console.log(`Room [${code}] registered by Host.`);
+            }
 
-                ws.isHost = true;
-                ws.roomCode = cleanHostCode;
-                rooms.set(cleanHostCode, { host: ws, players: new Map() });
-                
-                ws.send(JSON.stringify({ action: 'room_created', room_code: cleanHostCode }));
-                console.log(`Successfully opened room registry channel: ${cleanHostCode}`);
-                break;
-
-            case 'join_room':
-                if (!room_code || !name) return;
-                const cleanJoinCode = room_code.toUpperCase();
-
-                if (!rooms.has(cleanJoinCode)) {
-                    ws.send(JSON.stringify({ action: 'error', message: 'room_not_found' }));
+            else if (action === 'join_room') {
+                const code = roomCode.toUpperCase();
+                if (!rooms.has(code)) {
+                    ws.send(JSON.stringify({ type: 'error', message: 'Room not found.' }));
                     return;
                 }
+                
+                const room = rooms.get(code);
+                playerId = '_' + Math.random().toString(36).substr(2, 9); // Create a temporary unique ID
+                room.players.set(playerId, ws);
+                currentRoomCode = code;
 
-                const activeRoom = rooms.get(cleanJoinCode);
-                
-                ws.isHost = false;
-                ws.roomCode = cleanJoinCode;
-                ws.playerName = name;
-                activeRoom.players.set(name, ws);
-                
-                // Notify the Godot Host that a player has entered the lobby
-                if (activeRoom.host && activeRoom.host.readyState === 1) { // 1 = OPEN
-                    activeRoom.host.send(JSON.stringify({ action: 'player_joined', name: name }));
+                // Tell the player's phone that they succeeded
+                ws.send(JSON.stringify({ type: 'joined', playerId: playerId, roomCode: code }));
+
+                // Tell the Godot Host that a player joined
+                if (room.host && room.host.readyState === WebSocket.OPEN) {
+                    room.host.send(JSON.stringify({
+                        type: 'player_joined',
+                        playerId: playerId,
+                        playerName: data.playerName || 'Anonymous'
+                    }));
                 }
-                
-                console.log(`User '${name}' routed successfully to room: ${cleanJoinCode}`);
-                break;
+                console.log(`Player ${playerId} joined Room [${code}].`);
+            }
 
-            case 'host_command':
-            case 'update_client':
-                if (ws.roomCode && rooms.has(ws.roomCode)) {
-                    const roomChannels = rooms.get(ws.roomCode);
-                    
-                    if (target_name) {
-                        const clientSocket = roomChannels.players.get(target_name);
-                        if (clientSocket && clientSocket.readyState === 1) {
-                            clientSocket.send(JSON.stringify({ action: action, payload: payload }));
-                        }
-                    } else {
-                        // Global broadcast to all phone controllers in this room
-                        roomChannels.players.forEach((clientSocket) => {
-                            if (clientSocket.readyState === 1) {
-                                clientSocket.send(JSON.stringify({ action: action, payload: payload }));
-                            }
-                        });
-                    }
+            else if (action === 'send_to_host') {
+                // Relays phone input to Godot
+                if (!currentRoomCode || !rooms.has(currentRoomCode)) return;
+                const room = rooms.get(currentRoomCode);
+                if (room.host && room.host.readyState === WebSocket.OPEN) {
+                    room.host.send(JSON.stringify({
+                        type: 'player_input',
+                        playerId: playerId,
+                        payload: data
+                    }));
                 }
-                break;
+            }
 
-            case 'button_press':
-            case 'player_input':
-                if (ws.roomCode && rooms.has(ws.roomCode)) {
-                    const roomChannels = rooms.get(ws.roomCode);
-                    if (roomChannels.host && roomChannels.host.readyState === 1) {
-                        roomChannels.host.send(JSON.stringify({
-                            action: action,
-                            name: ws.playerName,
-                            payload: payload
+            else if (action === 'send_to_player') {
+                // Host sends something back to a specific phone (e.g., feedback/points)
+                if (!isHost || !currentRoomCode) return;
+                const room = rooms.get(currentRoomCode);
+                const targetId = parsed.targetPlayerId;
+                if (room && room.players.has(targetId)) {
+                    const playerWs = room.players.get(targetId);
+                    if (playerWs.readyState === WebSocket.OPEN) {
+                        playerWs.send(JSON.stringify({
+                            type: 'host_message',
+                            payload: data
                         }));
                     }
                 }
-                break;
+            }
 
-            case 'ping':
-                ws.send(JSON.stringify({ action: 'pong' }));
-                break;
+        } catch (e) {
+            console.error("Failed to parse message or route action:", e);
         }
     });
 
     ws.on('close', () => {
-        if (ws.roomCode && rooms.has(ws.roomCode)) {
-            const activeRoom = rooms.get(ws.roomCode);
-            
-            if (ws.isHost) {
-                console.log(`Host closed room socket connection: ${ws.roomCode}. Terminating channel records.`);
-                activeRoom.players.forEach((playerWs) => {
-                    if (playerWs.readyState === 1) {
-                        playerWs.send(JSON.stringify({ action: 'error', message: 'host_disconnected' }));
+        if (currentRoomCode && rooms.has(currentRoomCode)) {
+            const room = rooms.get(currentRoomCode);
+            if (isHost) {
+                // Host disconnected: Disconnect all players and clean up the room
+                for (const [pId, playerWs] of room.players) {
+                    if (playerWs.readyState === WebSocket.OPEN) {
+                        playerWs.send(JSON.stringify({ type: 'error', message: 'Host disconnected.' }));
+                        playerWs.close();
                     }
-                });
-                rooms.delete(ws.roomCode);
-            } else if (ws.playerName) {
-                console.log(`User '${ws.playerName}' dropped connection path from room: ${ws.roomCode}`);
-                activeRoom.players.delete(ws.playerName);
-                
-                if (activeRoom.host && activeRoom.host.readyState === 1) {
-                    activeRoom.host.send(JSON.stringify({ action: 'player_left', name: ws.playerName }));
                 }
+                rooms.delete(currentRoomCode);
+                console.log(`Room [${currentRoomCode}] cleared because host disconnected.`);
+            } else if (playerId) {
+                // Player disconnected: Inform host
+                room.players.delete(playerId);
+                if (room.host && room.host.readyState === WebSocket.OPEN) {
+                    room.host.send(JSON.stringify({
+                        type: 'player_left',
+                        playerId: playerId
+                    }));
+                }
+                console.log(`Player ${playerId} disconnected.`);
             }
         }
     });
 });
 
-console.log(`Stateless Party Game Relay Server online! Listening path open on port ${PORT}`);
+// Periodic ping/pong to keep connections alive on free tiers
+const interval = setInterval(() => {
+    wss.clients.forEach((ws) => {
+        if (ws.isAlive === false) return ws.terminate();
+        ws.isAlive = false;
+        ws.ping();
+    });
+}, 30000);
+
+wss.on('close', () => {
+    clearInterval(interval);
+});
+
+console.log(`Relay server actively listening on port ${PORT}`);
